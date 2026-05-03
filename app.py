@@ -1,41 +1,37 @@
 import streamlit as st
 import requests
 import itertools
+import json
+import re
 import google.generativeai as genai
 
-st.set_page_config(page_title="MCP + LLM Travel Assistant", layout="centered")
-st.title("MCP + LLM Travel Assistant")
+st.set_page_config(page_title="MCP Agent: Maps + Gemini", layout="centered")
+st.title("MCP Agent: Maps + Gemini")
 
 # ---------------- SIDEBAR ----------------
 st.sidebar.header("🔑 API Keys")
-
 maps_api = st.sidebar.text_input("Google Maps API Key", type="password")
+places_api = st.sidebar.text_input("Google Places API Key (optional)", type="password")
 gemini_api = st.sidebar.text_input("Gemini API Key", type="password")
 
 model_name = st.sidebar.selectbox(
     "Gemini Model",
-    ["gemini-2.5-flash", "gemini-1.5-flash"]
+    ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
 )
 
 if gemini_api:
     genai.configure(api_key=gemini_api)
 
-# ---------------- MCP TOOL ----------------
+# ---------------- MCP TOOLS ----------------
 def get_distance(origin, destination):
     url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": origin,
-        "destination": destination,
-        "key": maps_api
-    }
-
+    params = {"origin": origin, "destination": destination, "key": maps_api}
     res = requests.get(url, params=params).json()
 
     if res.get("status") != "OK":
-        return None
+        return {"error": res.get("status")}
 
     leg = res["routes"][0]["legs"][0]
-
     distance_text = leg["distance"]["text"]
     distance_val = float(distance_text.split()[0].replace(",", ""))
 
@@ -45,7 +41,21 @@ def get_distance(origin, destination):
         "duration": leg["duration"]["text"]
     }
 
-# ---------------- MATRIX ----------------
+def search_places(query):
+    if not places_api:
+        return {"error": "Places API key missing"}
+
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {"query": query, "key": places_api}
+    res = requests.get(url, params=params).json()
+
+    if res.get("status") != "OK":
+        return {"error": res.get("status")}
+
+    return [{"name": p["name"], "address": p.get("formatted_address", "")}
+            for p in res["results"][:5]]
+
+# ---------------- TSP (optional utility) ----------------
 def build_matrix(locations):
     matrix = {}
     for i in locations:
@@ -53,10 +63,9 @@ def build_matrix(locations):
         for j in locations:
             if i != j:
                 data = get_distance(i, j)
-                matrix[i][j] = data["distance_km"] if data else float("inf")
+                matrix[i][j] = data.get("distance_km", float("inf"))
     return matrix
 
-# ---------------- TSP ----------------
 def tsp_solver(locations, matrix):
     best_route = None
     min_distance = float("inf")
@@ -64,7 +73,6 @@ def tsp_solver(locations, matrix):
     for perm in itertools.permutations(locations):
         total = 0
         valid = True
-
         for i in range(len(perm) - 1):
             d = matrix[perm[i]].get(perm[i+1], float("inf"))
             if d == float("inf"):
@@ -78,62 +86,91 @@ def tsp_solver(locations, matrix):
 
     return best_route, min_distance
 
-# ---------------- LLM ----------------
-def analyze_with_llm(locations, route, distance):
-    model = genai.GenerativeModel(model_name)
+# ---------------- AGENT (LLM + TOOLS) ----------------
+SYSTEM_PROMPT = """
+You are an AI travel assistant with access to tools.
 
-    prompt = f"""
-User is traveling in Bangalore with elderly people.
+You can call tools by responding ONLY with valid JSON in this format:
+{
+  "action": "tool_name",
+  "input": { ... }
+}
 
-Locations: {locations}
-Optimized route: {route}
-Total distance: {distance:.2f} km
+Available tools:
+1. get_distance:
+   input: { "origin": "...", "destination": "..." }
 
-Suggest:
-- Best places to actually visit (reduce travel if needed)
-- Comfortable order
-- Why suitable for elderly
+2. search_places:
+   input: { "query": "..." }
 
-Keep it simple.
+Rules:
+- If the user asks about distance, routes, or travel → use get_distance
+- If user asks for places → use search_places
+- If you already have enough info → respond normally (no JSON)
+- After tool result is given, produce final answer in plain English
 """
 
-    response = model.generate_content(prompt)
-    return response.text
+def extract_json(text):
+    """Extract JSON block from LLM output safely."""
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except:
+        pass
+    return None
+
+def run_agent(user_query):
+    model = genai.GenerativeModel(model_name)
+
+    # Step 1: Ask model what to do
+    first = model.generate_content(SYSTEM_PROMPT + "\nUser: " + user_query)
+    action = extract_json(first.text)
+
+    # If no tool needed → return answer
+    if not action:
+        return first.text
+
+    tool_name = action.get("action")
+    tool_input = action.get("input", {})
+
+    # Step 2: Execute tool
+    if tool_name == "get_distance":
+        result = get_distance(tool_input.get("origin"), tool_input.get("destination"))
+
+    elif tool_name == "search_places":
+        result = search_places(tool_input.get("query"))
+
+    else:
+        return "Unknown tool requested."
+
+    # Step 3: Send result back to LLM for final answer
+    final_prompt = f"""
+User query: {user_query}
+
+Tool used: {tool_name}
+Tool result: {result}
+
+Now provide a helpful final answer.
+"""
+
+    final = model.generate_content(final_prompt)
+    return final.text
 
 # ---------------- UI ----------------
+st.header("Ask AI (Agent Mode)")
 
-st.header("Route Optimization + AI Advice")
-
-locations_input = st.text_input(
-    "Enter places",
-    placeholder="Lalbagh, Cubbon Park, Wonderla"
+query = st.text_area(
+    "Enter your request",
+    placeholder="e.g., Tell me places to visit for elderly in Bangalore\nor\nDistance between Bangalore and Mysore"
 )
 
-if st.button("Run"):
-    if not maps_api:
-        st.error("Enter Google Maps API key")
+if st.button("Run Agent"):
+    if not gemini_api:
+        st.error("Please enter Gemini API key")
     else:
-        locations = [l.strip() for l in locations_input.split(",") if l.strip()]
+        st.info("🤖 Thinking + using tools (MCP)...")
+        response = run_agent(query)
 
-        if len(locations) < 3:
-            st.warning("Enter at least 3 locations")
-        else:
-            st.info("MCP: Fetching distances from Google Maps...")
-            matrix = build_matrix(locations)
-
-            route, distance = tsp_solver(locations, matrix)
-
-            if route:
-                st.success(f"Optimal Route (TSP): {' → '.join(route)}")
-                st.success(f"Total Distance: {distance:.2f} km")
-
-                if gemini_api:
-                    st.info("LLM: Analyzing for elderly-friendly travel...")
-                    analysis = analyze_with_llm(locations, route, distance)
-
-                    st.markdown("### 🤖 Gemini Recommendation")
-                    st.write(analysis)
-                else:
-                    st.warning("Add Gemini API key for AI suggestions")
-            else:
-                st.error("Failed to compute route")
+        st.markdown("### 🤖 Response")
+        st.write(response)
