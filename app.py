@@ -1,11 +1,10 @@
 import streamlit as st
 import requests
 import json
-import re
 import google.generativeai as genai
 
-st.set_page_config(page_title="True MCP Agent", layout="centered")
-st.title("Conversational MCP Agent (Maps + Gemini)")
+st.set_page_config(page_title="Production MCP Travel Agent", layout="centered")
+st.title("🌍 Production MCP Travel Agent")
 
 # ---------------- KEYS ----------------
 st.sidebar.header("🔑 API Keys")
@@ -23,19 +22,18 @@ if gemini_api:
     genai.configure(api_key=gemini_api)
 
 # ---------------- TOOLS ----------------
-def search_places(query):
+def search_places(city):
+    query = f"top tourist attractions in {city}"
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {"query": query, "key": places_api}
     res = requests.get(url, params=params).json()
 
-    if res.get("status") != "OK":
-        return []
-
     return [{
-        "name": p["name"],
+        "name": p.get("name"),
         "rating": p.get("rating"),
         "address": p.get("formatted_address")
-    } for p in res["results"][:5]]
+    } for p in res.get("results", [])[:8]]
+
 
 def get_distance(origin, destination):
     url = "https://maps.googleapis.com/maps/api/directions/json"
@@ -43,116 +41,121 @@ def get_distance(origin, destination):
     res = requests.get(url, params=params).json()
 
     if res.get("status") != "OK":
-        return {}
+        return None
 
     leg = res["routes"][0]["legs"][0]
-
     return {
         "distance": leg["distance"]["text"],
         "duration": leg["duration"]["text"]
     }
 
-# ---------------- AGENT ----------------
-SYSTEM_PROMPT = """
-You are a travel planning assistant with tool access.
+# ---------------- LLM CALL ----------------
+def llm(prompt):
+    model = genai.GenerativeModel(model_name)
+    return model.generate_content(prompt).text
 
-TOOLS:
+# ---------------- MAIN PIPELINE ----------------
+def run_agent(user_query):
 
-1. search_places
-Input:
-{ "query": "..." }
+    # -------- STEP 1: EXTRACT CITY --------
+    city_prompt = f"""
+Extract the main travel city from this query:
 
-2. get_distance
-Input:
-{ "origin": "...", "destination": "..." }
+{user_query}
 
-RULES:
-- You can call tools multiple times
-- Plan step-by-step
-- Build itinerary gradually
-- Always use real data
-- When done, provide final answer
+Return ONLY the city name.
+"""
+    city = llm(city_prompt).strip()
 
-TO CALL TOOL:
-Return ONLY JSON:
-{
-  "action": "tool_name",
-  "input": {...}
-}
+    st.info(f"📍 Detected city: {city}")
 
-TO FINISH:
-Return normal text (no JSON)
+    # -------- STEP 2: FETCH PLACES --------
+    places = search_places(city)
+
+    st.info("🔧 Fetching places from Google Maps...")
+    st.json(places)
+
+    # -------- STEP 3: SELECT TOP PLACES --------
+    plan_prompt = f"""
+User query:
+{user_query}
+
+Places:
+{places}
+
+Select best 5 places considering:
+- ratings
+- variety
+- travel feasibility
+
+Return ONLY list of place names.
+"""
+    selected = llm(plan_prompt)
+
+    selected_places = [p.strip("- ").strip() for p in selected.split("\n") if p.strip()]
+
+    # -------- STEP 4: DISTANCE MATRIX --------
+    st.info("🚗 Calculating travel distances...")
+
+    routes = []
+    base = None
+
+    # detect hotel if mentioned
+    if "taj" in user_query.lower():
+        base = "Taj Bangalore"
+
+    for place in selected_places:
+        origin = base if base else selected_places[0]
+        dist = get_distance(origin, place)
+
+        if dist:
+            routes.append({
+                "from": origin,
+                "to": place,
+                "distance": dist["distance"],
+                "duration": dist["duration"]
+            })
+
+    st.json(routes)
+
+    # -------- STEP 5: FINAL SYNTHESIS --------
+    final_prompt = f"""
+User query:
+{user_query}
+
+City:
+{city}
+
+Selected places:
+{selected_places}
+
+Travel data:
+{routes}
+
+Create a FINAL travel plan:
+
+- Top 5 places with short explanation
+- 2-day itinerary
+- Travel times from base location
+- Why these places are good
+- Keep it clean and human-friendly
 """
 
-def extract_json(text):
-    try:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except:
-        pass
-    return None
+    return llm(final_prompt)
 
-def run_agent(query):
-    model = genai.GenerativeModel(model_name)
-
-    messages = [{"role": "user", "content": query}]
-
-    for step in range(5):  # allow multiple tool steps
-        prompt = SYSTEM_PROMPT + "\n\n" + json.dumps(messages)
-
-        response = model.generate_content(prompt)
-        text = response.text
-
-        action = extract_json(text)
-
-        if not action:
-            return text  # final answer
-
-        tool = action.get("action")
-        inp = action.get("input", {})
-
-        st.info(f"🔧 Tool: {tool} → {inp}")
-
-        # execute tool
-        if tool == "search_places":
-            result = search_places(inp.get("query"))
-
-        elif tool == "get_distance":
-            result = get_distance(
-                inp.get("origin"),
-                inp.get("destination")
-            )
-
-        else:
-            result = {"error": "unknown tool"}
-
-        st.json(result)
-
-        # feed back result
-        messages.append({
-            "role": "assistant",
-            "content": text
-        })
-        messages.append({
-            "role": "user",
-            "content": f"Tool result: {result}"
-        })
-
-    return "Max steps reached"
 
 # ---------------- UI ----------------
 query = st.text_area(
     "Ask your travel question",
-    placeholder="I want to travel to Bangalore in May from Taj Bangalore..."
+    placeholder="Tell me a 2 day trip to Shimla in March"
 )
 
 if st.button("Run Agent"):
     if not (maps_api and places_api and gemini_api):
-        st.error("Enter all API keys")
+        st.error("Please enter all API keys")
     else:
-        st.info("🤖 Running multi-step MCP agent...")
-        answer = run_agent(query)
+        st.info("🤖 Running production MCP agent...")
+        result = run_agent(query)
 
-        st.markdown("### 🤖 Final Plan")
-        st.write(answer)
+        st.markdown("### 🧭 Final Travel Plan")
+        st.write(result)
