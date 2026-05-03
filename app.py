@@ -1,23 +1,20 @@
 import streamlit as st
 import requests
 import itertools
-import os
-
-# Gemini
 import google.generativeai as genai
 
 st.set_page_config(page_title="MCP + LLM Travel Assistant", layout="centered")
 st.title("MCP + LLM Travel Assistant")
 
-# ---------------- USER CONFIG ----------------
-st.sidebar.header("🔑 API Configuration")
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("🔑 API Keys")
 
 maps_api = st.sidebar.text_input("Google Maps API Key", type="password")
 gemini_api = st.sidebar.text_input("Gemini API Key", type="password")
 
 model_name = st.sidebar.selectbox(
-    "Select Gemini Model",
-    ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    "Gemini Model",
+    ["gemini-2.5-flash", "gemini-1.5-flash"]
 )
 
 if gemini_api:
@@ -48,7 +45,7 @@ def get_distance(origin, destination):
         "duration": leg["duration"]["text"]
     }
 
-# ---------------- BUILD MATRIX ----------------
+# ---------------- MATRIX ----------------
 def build_matrix(locations):
     matrix = {}
     for i in locations:
@@ -81,68 +78,38 @@ def tsp_solver(locations, matrix):
 
     return best_route, min_distance
 
-# ---------------- LLM ANALYSIS ----------------
+# ---------------- LLM ----------------
 def analyze_with_llm(locations, route, distance):
-    try:
-        model = genai.GenerativeModel(model_name)
+    model = genai.GenerativeModel(model_name)
 
-        prompt = f"""
-You are a travel assistant.
+    prompt = f"""
+User is traveling in Bangalore with elderly people.
 
-User wants to visit these locations in Bangalore:
-{locations}
-
-Optimized route is:
-{route}
-
+Locations: {locations}
+Optimized route: {route}
 Total distance: {distance:.2f} km
 
-User condition:
-- Traveling with elderly people
-- Avoid long travel
-- Prefer less crowded, easy-access places
+Suggest:
+- Best places to actually visit (reduce travel if needed)
+- Comfortable order
+- Why suitable for elderly
 
-Tasks:
-1. Suggest best subset of places (if needed)
-2. Recommend order of visit
-3. Explain why it is suitable for elderly
-4. Keep response simple and practical
+Keep it simple.
 """
 
-        response = model.generate_content(prompt)
-        return response.text
-
-    except Exception as e:
-        return f"LLM Error: {str(e)}"
+    response = model.generate_content(prompt)
+    return response.text
 
 # ---------------- UI ----------------
 
-# ---- BASIC DISTANCE ----
-st.header("1. Distance & Travel Info")
-
-origin = st.text_input("Origin", placeholder="Bangalore")
-destination = st.text_input("Destination", placeholder="Mysore")
-
-if st.button("Get Distance"):
-    if not maps_api:
-        st.error("Enter Google Maps API key")
-    else:
-        result = get_distance(origin, destination)
-        if result:
-            st.success(f"Distance: {result['distance_text']}")
-            st.success(f"Duration: {result['duration']}")
-        else:
-            st.error("Error fetching data")
-
-# ---- ROUTE OPTIMIZATION ----
-st.header("2. Optimize Route + LLM Advice")
+st.header("Route Optimization + AI Advice")
 
 locations_input = st.text_input(
-    "Enter places (comma separated)",
+    "Enter places",
     placeholder="Lalbagh, Cubbon Park, Wonderla"
 )
 
-if st.button("Optimize + Analyze"):
+if st.button("Run"):
     if not maps_api:
         st.error("Enter Google Maps API key")
     else:
@@ -151,21 +118,22 @@ if st.button("Optimize + Analyze"):
         if len(locations) < 3:
             st.warning("Enter at least 3 locations")
         else:
-            st.info("Fetching distances via MCP...")
+            st.info("MCP: Fetching distances from Google Maps...")
             matrix = build_matrix(locations)
 
             route, distance = tsp_solver(locations, matrix)
 
             if route:
-                st.success(f"Best Route: {' → '.join(route)}")
+                st.success(f"Optimal Route (TSP): {' → '.join(route)}")
                 st.success(f"Total Distance: {distance:.2f} km")
 
                 if gemini_api:
-                    st.info("Running LLM analysis...")
+                    st.info("LLM: Analyzing for elderly-friendly travel...")
                     analysis = analyze_with_llm(locations, route, distance)
-                    st.markdown("### 🤖 LLM Recommendation")
+
+                    st.markdown("### 🤖 Gemini Recommendation")
                     st.write(analysis)
                 else:
-                    st.warning("Add Gemini API key for AI recommendations")
+                    st.warning("Add Gemini API key for AI suggestions")
             else:
-                st.error("Route optimization failed")
+                st.error("Failed to compute route")
